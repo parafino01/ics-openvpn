@@ -1,7 +1,5 @@
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@color/logobackground" />
-    <foreground android:drawable="@drawable/ic_logo_bunt" />
-
-    <!--  Android 13 (API level 33) allows monochrome logos -->
-    <monochrome android:drawable="@drawable/ic_logo_sw"/>
+    <background android:drawable="@drawable/ic_para_bg" />
+    <foreground android:drawable="@drawable/ic_para_fg" />
+    <monochrome android:drawable="@drawable/ic_para_mono" />
 </adaptive-icon>
