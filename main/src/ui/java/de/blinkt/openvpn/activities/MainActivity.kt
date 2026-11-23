@@ -1,5 +1,5 @@
 /*
- * Tela simples estilo "X-VPN" para o fork do ics-openvpn.
+ * PARA VPN - tela estilo "X-VPN" para o fork do ics-openvpn.
  * Substitui o MainActivity original (mesmo pacote e mesmo nome,
  * entao o AndroidManifest e a notificacao continuam funcionando).
  * Licenca: GPLv2 (como o projeto original).
@@ -30,6 +30,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -40,6 +41,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import de.blinkt.openvpn.LaunchVPN
+import de.blinkt.openvpn.R
 import de.blinkt.openvpn.VpnProfile
 import de.blinkt.openvpn.core.ConfigParser
 import de.blinkt.openvpn.core.ConnectionStatus
@@ -112,6 +114,17 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             if (bold) typeface = Typeface.DEFAULT_BOLD
         }
 
+    private fun chip(text: String, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            this.text = text
+            setTextColor(textMain)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), 0, dp(14), 0)
+            background = rounded(card, 20)
+            setOnClickListener { onClick() }
+        }
+
     // ---------------------------------------------------------------- UI
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -143,17 +156,24 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val title = label("Meu VPN", 22f, textMain, true)
-        top.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val importBtn = Button(this).apply {
-            text = "+ .ovpn"
-            isAllCaps = false
-            setTextColor(textMain)
-            background = rounded(card, 20)
-            setOnClickListener { importLauncher.launch(arrayOf("*/*")) }
+        val logo = ImageView(this).apply {
+            setImageResource(R.drawable.ic_para_fg)
+            scaleType = ImageView.ScaleType.FIT_CENTER
         }
-        top.addView(importBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)))
+        top.addView(logo, LinearLayout.LayoutParams(dp(64), dp(64)).apply { leftMargin = -dp(10) })
+
+        val title = label("PARA VPN", 22f, textMain, true).apply { letterSpacing = 0.08f }
+        top.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            .apply { leftMargin = -dp(6) })
+
+        top.addView(chip("Logs") {
+            startActivity(Intent(this@MainActivity, LogWindow::class.java))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38))
+            .apply { rightMargin = dp(8) })
+
+        top.addView(chip("+ .ovpn") {
+            importLauncher.launch(arrayOf("*/*"))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38)))
         root.addView(top)
 
         // Area central: botao grande
