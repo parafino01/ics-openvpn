@@ -1,6 +1,8 @@
 name: APK
+
 permissions:
   contents: read
+
 on:
   workflow_dispatch:
 
@@ -9,20 +11,29 @@ jobs:
     name: Build UiOvpn23
     runs-on: ubuntu-latest
     steps:
-      - name: Debug signing
-        run: mkdir -p ~/.gradle && echo -e "icsopenvpnDebugSign=true\norg.gradle.jvmargs=-Xmx2048M" > ~/.gradle/gradle.properties
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
-          submodules: true
-      - uses: actions/setup-java@v6
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
         with:
-          java-version: 25
+          java-version: 21
           cache: gradle
           distribution: temurin
-      - uses: android-actions/setup-android@v4
-      - name: Build
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Build Release APK
         run: ./gradlew assembleUiOvpn23Release
-      - uses: actions/upload-artifact@v4
+
+      - name: Gerar assinatura automática e assinar APK
+        run: |
+          keytool -genkeypair -v -keystore auto.jks -keyalg RSA -keysize 2048 -validity 10000 -alias app -storepass 123456 -keypass 123456 -dname "CN=OpenVPN, OU=App, O=VPN, L=City, S=State, C=MZ"
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -n 1)
+          $APKSIGNER sign --ks auto.jks --ks-key-alias app --ks-pass pass:123456 --key-pass pass:123456 --out app-assinado.apk main/build/outputs/apk/uiOvpn23/release/*.apk
+
+      - name: Upload APK Assinado
+        uses: actions/upload-artifact@v4
         with:
-          name: apk
-          path: main/build/outputs/apk/**/*.apk
+          name: apk-pronto
+          path: app-assinado.apk
