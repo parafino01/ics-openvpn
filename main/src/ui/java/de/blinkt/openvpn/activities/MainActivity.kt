@@ -60,12 +60,16 @@ import de.blinkt.openvpn.core.ProfileManager
 import de.blinkt.openvpn.core.VpnStatus
 import java.io.StringReader
 import java.net.ConnectException
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.util.Collections
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 
-class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.ByteCountListener {
+class MainActivity : AppCompatActivity(), VpnStatus.StateListener {
 
     private enum class UiState { IDLE, CONNECTING, CONNECTED }
 
@@ -101,9 +105,6 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
     private var pulse: ObjectAnimator? = null
     private var uiState = UiState.IDLE
     private var connectedSince = 0L
-    private var lastTs = 0L
-    private var lastIn = 0L
-    private var lastOut = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
@@ -128,6 +129,15 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             if (r.resultCode == RESULT_OK) unlock() else toast("App continua bloqueado")
         }
 
+    private val isTv: Boolean by lazy {
+        val um = getSystemService(Context.UI_MODE_SERVICE) as android.app.UiModeManager
+        um.currentModeType == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+    }
+    private fun hPad(): Int = if (isTv) dp(56) else dp(20)
+    private fun vPad(): Int = if (isTv) dp(32) else dp(12)
+
+    private var receiveServer: ServerSocket? = null
     private var advanced = false
     private var locked = false
     private var unlocked = false
@@ -165,6 +175,17 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             if (bold) typeface = Typeface.DEFAULT_BOLD
         }
 
+    /** Deixa o item selecionavel pelo controle remoto, com destaque ao receber foco. */
+    private fun makeFocusable(v: View, stroke: Boolean) {
+        v.isFocusable = true
+        v.setOnFocusChangeListener { view, has ->
+            val sc = if (has) 1.06f else 1f
+            view.animate().scaleX(sc).scaleY(sc).setDuration(120).start()
+            val bgd = view.background
+            if (stroke && bgd is GradientDrawable) bgd.setStroke(if (has) dp(3) else 0, green)
+        }
+    }
+
     private fun chip(text: String, onClick: () -> Unit): TextView =
         TextView(this).apply {
             this.text = text
@@ -174,6 +195,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             setPadding(dp(14), 0, dp(14), 0)
             background = rounded(card, 20)
             setOnClickListener { onClick() }
+            makeFocusable(this, true)
         }
 
     private fun field(hint: String, lines: Int = 1, input: Int = InputType.TYPE_CLASS_TEXT): EditText =
@@ -220,11 +242,14 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         }
 
         advanced = prefs().getBoolean("advanced", false)
+        SpeedMonitor.start()
 
         val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(12), dp(20), dp(16))
+            orientation = if (isTv) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+            setPadding(hPad(), vPad(), hPad(), vPad())
         }
+        val rightPane = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val rightTarget: ViewGroup = if (isTv) rightPane else root
         val scroll = ScrollView(this).apply {
             setBackgroundColor(bg)
             isFillViewport = true
@@ -233,7 +258,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         }
         ViewCompat.setOnApplyWindowInsetsListener(scroll) { _, insets ->
             val b = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            root.setPadding(dp(20), b.top + dp(12), dp(20), b.bottom + dp(16))
+            root.setPadding(hPad(), b.top + vPad(), hPad(), b.bottom + vPad())
             insets
         }
 
@@ -259,7 +284,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         top.addView(chip("Logs") {
             startActivity(Intent(this@MainActivity, LogWindow::class.java))
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38)))
-        root.addView(top)
+        rightTarget.addView(top)
 
         // Area central
         val center = LinearLayout(this).apply {
@@ -273,6 +298,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             setTextColor(textMain)
             setOnClickListener { onConnectClicked() }
         }
+        makeFocusable(connectBtn, false)
         center.addView(connectBtn, LinearLayout.LayoutParams(dp(190), dp(190)))
 
         statusTv = label("Desconectado", 18f, textMain, true).apply { gravity = Gravity.CENTER }
@@ -321,8 +347,15 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             ViewGroup.LayoutParams.MATCH_PARENT, dp(64)
         ).apply { topMargin = dp(10) })
 
-        root.addView(center, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        if (isTv) {
+            root.addView(center, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            rightPane.addView(View(this), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            root.addView(rightPane, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+                .apply { leftMargin = dp(40) })
+        } else {
+            root.addView(center, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        }
 
         // Cartao do servidor
         val serverCard = LinearLayout(this).apply {
@@ -331,12 +364,13 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             setPadding(dp(18), dp(14), dp(18), dp(14))
             setOnClickListener { showServerDialog() }
         }
+        makeFocusable(serverCard, true)
         serverCard.addView(label("Servidor", 12f, textSub))
         serverNameTv = label("Nenhum perfil", 17f, textMain, true)
         serverCard.addView(serverNameTv)
         serverSubTv = label("Toque para adicionar um servidor", 12f, textSub)
         serverCard.addView(serverSubTv)
-        root.addView(serverCard, LinearLayout.LayoutParams(
+        rightTarget.addView(serverCard, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(16) })
 
@@ -347,7 +381,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         optionsChip = chip("Opções") { showOptionsDialog() }
         row.addView(optionsChip,
             LinearLayout.LayoutParams(0, dp(50), 1f).apply { leftMargin = dp(5) })
-        root.addView(row, LinearLayout.LayoutParams(
+        rightTarget.addView(row, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(10) })
 
@@ -364,6 +398,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         applyMode()
         applyState(UiState.IDLE, "Desconectado")
         refreshServerCard()
+        if (isTv) connectBtn.requestFocus()
 
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
@@ -392,10 +427,10 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
     override fun onResume() {
         super.onResume()
         refreshServerCard()
-        lastTs = 0L
         VpnStatus.addStateListener(this)
-        VpnStatus.addByteCountListener(this)
         VpnStatus.addLogListener(logListener)
+        SpeedMonitor.onUpdate = { runOnUiThread { refreshSpeed() } }
+        refreshSpeed()
 
         if (lockEnabled()) {
             setSecure(true)
@@ -415,12 +450,13 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         super.onPause()
         leftAt = SystemClock.elapsedRealtime()
         VpnStatus.removeStateListener(this)
-        VpnStatus.removeByteCountListener(this)
+        SpeedMonitor.onUpdate = null
         VpnStatus.removeLogListener(logListener)
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        stopReceiveServer()
         pulse?.cancel()
         handler.removeCallbacks(ticker)
     }
@@ -428,9 +464,6 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
     // ---------------------------------------------------------- Estado
 
     private fun resetSpeed() {
-        lastTs = 0L
-        lastIn = 0L
-        lastOut = 0L
         downTv.text = "0 B/s"
         upTv.text = "0 B/s"
         downTotalTv.text = "Total: 0 B"
@@ -476,8 +509,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         }
 
         if (state == UiState.CONNECTED && previous != UiState.CONNECTED) {
-            connectedSince = SystemClock.elapsedRealtime()
-            lastTs = 0L
+            connectedSince = SpeedMonitor.ensureConnected()
             handler.removeCallbacks(ticker)
             handler.post(ticker)
         } else if (state != UiState.CONNECTED) {
@@ -517,26 +549,16 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
 
     override fun setConnectedVPN(uuid: String?) {}
 
-    override fun updateByteCount(inBytes: Long, outBytes: Long, diffIn: Long, diffOut: Long) {
-        val now = SystemClock.elapsedRealtime()
-        runOnUiThread {
-            var dl = 0.0
-            var ul = 0.0
-            if (lastTs != 0L && now > lastTs) {
-                val dt = (now - lastTs) / 1000.0
-                if (inBytes >= lastIn) dl = (inBytes - lastIn) / dt
-                if (outBytes >= lastOut) ul = (outBytes - lastOut) / dt
-            }
-            lastTs = now
-            lastIn = inBytes
-            lastOut = outBytes
-            downTv.text = humanSpeed(dl)
-            upTv.text = humanSpeed(ul)
-            downTotalTv.text = "Total: " + humanBytes(inBytes)
-            upTotalTv.text = "Total: " + humanBytes(outBytes)
-            speedLine.text = "↓ ${humanSpeed(dl)}     ↑ ${humanSpeed(ul)}"
-            graph.push(dl.toFloat(), ul.toFloat())
-        }
+    /** Atualiza os numeros e o grafico a partir do monitor (que roda mesmo em segundo plano). */
+    private fun refreshSpeed() {
+        val m = SpeedMonitor
+        downTv.text = humanSpeed(m.downBps)
+        upTv.text = humanSpeed(m.upBps)
+        downTotalTv.text = "Total: " + humanBytes(m.totalIn)
+        upTotalTv.text = "Total: " + humanBytes(m.totalOut)
+        speedLine.text = "↓ ${humanSpeed(m.downBps)}     ↑ ${humanSpeed(m.upBps)}"
+        val (dd, uu) = m.snapshot()
+        graph.setData(dd, uu)
     }
 
     private fun humanBytes(b: Long): String {
@@ -613,23 +635,229 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             .show()
     }
 
+    private fun pickFile() {
+        try {
+            importLauncher.launch(arrayOf("*/*"))
+        } catch (e: Exception) {
+            showError(
+                "Seletor de arquivos indisponível",
+                "Este aparelho não tem seletor de arquivos. Use \"Importar por link\" ou \"Enviar do celular\"."
+            )
+        }
+    }
+
     private fun showAddDialog() {
-        val items = arrayOf(
-            "📁 Importar arquivo .ovpn",
-            "📋 Colar configuração",
-            "⚙ Configuração manual"
-        )
+        val labels = ArrayList<String>()
+        val actions = ArrayList<() -> Unit>()
+        fun item(l: String, a: () -> Unit) { labels.add(l); actions.add(a) }
+        if (isTv) item("📱 Enviar do celular (Wi-Fi)") { showReceiveDialog() }
+        if (isTv) item("🔗 Importar por link") { showUrlDialog() }
+        item("📁 Importar arquivo .ovpn") { pickFile() }
+        item("📋 Colar configuração") { showPasteDialog() }
+        item("⚙ Configuração manual") { showManualDialog() }
+        if (!isTv) item("🔗 Importar por link") { showUrlDialog() }
         AlertDialog.Builder(this)
             .setTitle("Adicionar servidor")
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> importLauncher.launch(arrayOf("*/*"))
-                    1 -> showPasteDialog()
-                    else -> showManualDialog()
-                }
-            }
+            .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
             .show()
     }
+
+    // ------------------------------------------------ Importar por link
+
+    private fun showUrlDialog() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(12), dp(24), 0)
+        }
+        val url = field("https://.../servidor.ovpn",
+            input = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        box.addView(url)
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Importar por link")
+            .setMessage("Digite o endereço (https) do arquivo .ovpn.")
+            .setView(box)
+            .setPositiveButton("Baixar", null)
+            .setNegativeButton("Cancelar", null)
+            .create()
+        dlg.show()
+        dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val u = url.text.toString().trim()
+            if (!u.startsWith("https://", true)) {
+                toast("Use um link que comece com https://")
+                return@setOnClickListener
+            }
+            dlg.dismiss()
+            toast("Baixando…")
+            Thread {
+                try {
+                    val conn = URL(u).openConnection() as java.net.HttpURLConnection
+                    conn.connectTimeout = 10000
+                    conn.readTimeout = 15000
+                    val bytes = conn.inputStream.use { it.readBytes() }
+                    conn.disconnect()
+                    if (bytes.size > 1000000) throw Exception("Arquivo grande demais")
+                    val text = String(bytes, Charsets.UTF_8)
+                    var nm = u.substringBefore('?').substringAfterLast('/')
+                    if (nm.endsWith(".ovpn", true)) nm = nm.dropLast(5)
+                    runOnUiThread { importConfig(text, nm.ifBlank { "VPN" }) }
+                } catch (e: Exception) {
+                    runOnUiThread { showError("Erro ao baixar", e.localizedMessage ?: e.toString()) }
+                }
+            }.start()
+        }
+    }
+
+    // ------------------------------------- Receber do celular (Wi-Fi)
+
+    private fun stopReceiveServer() {
+        try { receiveServer?.close() } catch (e: Exception) { }
+        receiveServer = null
+    }
+
+    private fun localIp(): String? {
+        return try {
+            val en = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (ni in Collections.list(en)) {
+                if (!ni.isUp || ni.isLoopback || ni.name.startsWith("tun")) continue
+                for (a in Collections.list(ni.inetAddresses)) {
+                    if (a is Inet4Address && a.isSiteLocalAddress) return a.hostAddress
+                }
+            }
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun showReceiveDialog() {
+        val ip = localIp()
+        if (ip == null) {
+            showError("Sem rede local", "Conecte a TV ao Wi-Fi ou cabo para receber a configuração do celular.")
+            return
+        }
+        stopReceiveServer()
+        val token = (100000 + java.util.Random().nextInt(900000)).toString()
+        val ss: ServerSocket? = try {
+            ServerSocket(8088)
+        } catch (e: Exception) {
+            try { ServerSocket(0) } catch (e2: Exception) { null }
+        }
+        if (ss == null) {
+            showError("Erro", "Não foi possível abrir a porta de recebimento.")
+            return
+        }
+        receiveServer = ss
+        val url = "http://$ip:${ss.localPort}/$token"
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Enviar do celular")
+            .setMessage(
+                "No celular (no mesmo Wi-Fi), abra o navegador e acesse:\n\n$url\n\n" +
+                "Escolha o arquivo .ovpn (ou cole a configuração) e toque em Enviar.\n\n" +
+                "A conexão é local e só fica aberta enquanto esta janela estiver na tela."
+            )
+            .setNegativeButton("Cancelar", null)
+            .create()
+        dlg.setOnDismissListener { stopReceiveServer() }
+        dlg.show()
+        Thread {
+            while (!ss.isClosed) {
+                try {
+                    val c = ss.accept()
+                    handleClient(c, token) { name, cfg ->
+                        runOnUiThread { if (importConfig(cfg, name)) dlg.dismiss() }
+                    }
+                } catch (e: Exception) {
+                    if (ss.isClosed) break
+                }
+            }
+        }.start()
+    }
+
+    private fun handleClient(c: Socket, token: String, onDone: (String, String) -> Unit) {
+        try {
+            c.soTimeout = 8000
+            val ins = java.io.BufferedInputStream(c.getInputStream())
+            val out = c.getOutputStream()
+            val head = StringBuilder()
+            while (head.length < 16384) {
+                val b = ins.read()
+                if (b < 0) break
+                head.append(b.toChar())
+                if (head.endsWith("\r\n\r\n")) break
+            }
+            val lines = head.toString().split("\r\n")
+            val parts = lines.firstOrNull()?.split(" ") ?: return
+            if (parts.size < 2) return
+            val method = parts[0]
+            val path = parts[1].substringBefore('?')
+            var len = 0
+            for (l in lines) {
+                if (l.startsWith("content-length:", true)) len = l.substringAfter(':').trim().toIntOrNull() ?: 0
+            }
+            fun send(code: String, body: String) {
+                val bytes = body.toByteArray(Charsets.UTF_8)
+                val header = "HTTP/1.1 $code\r\nContent-Type: text/html; charset=utf-8\r\n" +
+                    "Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+                out.write(header.toByteArray())
+                out.write(bytes)
+                out.flush()
+            }
+            if (path != "/$token") {
+                send("404 Not Found", "<h3>Link inválido</h3>")
+                return
+            }
+            if (method == "POST") {
+                if (len <= 0 || len > 400000) {
+                    send("400 Bad Request", "<h3>Dados inválidos</h3>")
+                    return
+                }
+                val buf = ByteArray(len)
+                var read = 0
+                while (read < len) {
+                    val n = ins.read(buf, read, len - read)
+                    if (n < 0) break
+                    read += n
+                }
+                val body = String(buf, 0, read, Charsets.UTF_8)
+                var name = ""
+                var cfg = ""
+                for (kv in body.split("&")) {
+                    val k = java.net.URLDecoder.decode(kv.substringBefore('='), "UTF-8")
+                    val v = java.net.URLDecoder.decode(kv.substringAfter('=', ""), "UTF-8")
+                    if (k == "name") name = v else if (k == "cfg") cfg = v
+                }
+                if (cfg.isBlank()) {
+                    send("400 Bad Request", uploadPage("Escolha o arquivo ou cole a configuração."))
+                    return
+                }
+                onDone(name.ifBlank { "VPN" }, cfg)
+                send("200 OK", "<!doctype html><meta charset='utf-8'>" +
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                    "<body style='font-family:sans-serif;padding:24px'><h2>✅ Enviado!</h2><p>Veja a TV.</p>")
+            } else {
+                send("200 OK", uploadPage(""))
+            }
+        } catch (e: Exception) {
+        } finally {
+            try { c.close() } catch (e: Exception) { }
+        }
+    }
+
+    private fun uploadPage(msg: String): String =
+        "<!doctype html><html><head><meta charset='utf-8'>" +
+        "<meta name='viewport' content='width=device-width,initial-scale=1'><title>PARA VPN</title></head>" +
+        "<body style='font-family:sans-serif;background:#0E1224;color:#fff;padding:20px'>" +
+        "<h2>PARA VPN</h2><p style='color:#FFB020'>$msg</p>" +
+        "<form method='POST'>" +
+        "<p>Nome do servidor:<br><input id='name' name='name' style='width:100%;padding:10px;font-size:16px'></p>" +
+        "<p>Arquivo .ovpn:<br><input type='file' onchange=\"var f=this.files[0];if(!f)return;" +
+        "var r=new FileReader();r.onload=function(){document.getElementById('cfg').value=r.result;" +
+        "var n=document.getElementById('name');if(!n.value)n.value=f.name.replace(/\\.ovpn\$/i,'')};" +
+        "r.readAsText(f)\"></p>" +
+        "<p>Ou cole a configuração:<br><textarea id='cfg' name='cfg' rows='12' " +
+        "style='width:100%;font-size:14px'></textarea></p>" +
+        "<button style='padding:14px 28px;font-size:18px;background:#19D38B;border:0;border-radius:10px'>Enviar</button>" +
+        "</form></body></html>"
 
     private fun removeProfile(p: VpnProfile) {
         AlertDialog.Builder(this)
@@ -894,28 +1122,22 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
     private fun showOptionsDialog() {
         val sel = selectedProfile()
         val tuned = sel != null && isTuned(sel)
-        val items = arrayOf(
-            "DNS personalizado",
-            "Apps que usam a VPN",
-            if (tuned) "⚡ Otimizar velocidade: LIGADO" else "⚡ Otimizar velocidade: DESLIGADO",
-            "Dicas para mais velocidade",
-            if (lockEnabled()) "🔒 Bloqueio do app (PIN/digital): LIGADO" else "🔓 Bloqueio do app (PIN/digital): DESLIGADO",
-            "Bloquear internet sem VPN",
-            "Ver meu IP público"
-        )
+        val labels = ArrayList<String>()
+        val actions = ArrayList<() -> Unit>()
+        fun item(l: String, a: () -> Unit) { labels.add(l); actions.add(a) }
+        item("DNS personalizado") { showDnsDialog() }
+        item("Apps que usam a VPN") { showAppsDialog() }
+        item(if (tuned) "⚡ Otimizar velocidade: LIGADO" else "⚡ Otimizar velocidade: DESLIGADO") { toggleTuning() }
+        item("Dicas para mais velocidade") { showSpeedTips() }
+        if (!isTv) {
+            item(if (lockEnabled()) "🔒 Bloqueio do app (PIN/digital): LIGADO"
+                 else "🔓 Bloqueio do app (PIN/digital): DESLIGADO") { toggleLock() }
+        }
+        item("Bloquear internet sem VPN") { showKillSwitchDialog() }
+        item("Ver meu IP público") { showIp() }
         AlertDialog.Builder(this)
             .setTitle("Opções")
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> showDnsDialog()
-                    1 -> showAppsDialog()
-                    2 -> toggleTuning()
-                    3 -> showSpeedTips()
-                    4 -> toggleLock()
-                    5 -> showKillSwitchDialog()
-                    else -> showIp()
-                }
-            }
+            .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
             .show()
     }
 
@@ -1327,6 +1549,12 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             invalidate()
         }
 
+        fun setData(dv: FloatArray, uv: FloatArray) {
+            System.arraycopy(dv, 0, d, 0, minOf(n, dv.size))
+            System.arraycopy(uv, 0, u, 0, minOf(n, uv.size))
+            invalidate()
+        }
+
         fun clear() {
             d.fill(0f)
             u.fill(0f)
@@ -1355,4 +1583,100 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             c.drawPath(path, paint)
         }
     }
+}
+
+/**
+ * Mede a velocidade em nivel de processo: continua funcionando com o app em
+ * segundo plano, e o historico do grafico e o cronometro sobrevivem a
+ * recriacao da tela.
+ */
+object SpeedMonitor : VpnStatus.ByteCountListener, VpnStatus.StateListener {
+    private const val N = 40
+    private val lock = Any()
+    private val d = FloatArray(N)
+    private val u = FloatArray(N)
+    private var started = false
+    private var lastTs = 0L
+    private var lastIn = 0L
+    private var lastOut = 0L
+
+    @Volatile var downBps = 0.0
+    @Volatile var upBps = 0.0
+    @Volatile var totalIn = 0L
+    @Volatile var totalOut = 0L
+    @Volatile var connectedSince = 0L
+    @Volatile var onUpdate: (() -> Unit)? = null
+
+    fun start() {
+        synchronized(lock) {
+            if (started) return
+            started = true
+        }
+        VpnStatus.addStateListener(this)
+        VpnStatus.addByteCountListener(this)
+    }
+
+    fun ensureConnected(): Long {
+        synchronized(lock) {
+            if (connectedSince == 0L) connectedSince = SystemClock.elapsedRealtime()
+            return connectedSince
+        }
+    }
+
+    fun snapshot(): Pair<FloatArray, FloatArray> =
+        synchronized(lock) { Pair(d.copyOf(), u.copyOf()) }
+
+    private fun reset() {
+        synchronized(lock) {
+            d.fill(0f)
+            u.fill(0f)
+            lastTs = 0L
+            lastIn = 0L
+            lastOut = 0L
+            downBps = 0.0
+            upBps = 0.0
+            totalIn = 0L
+            totalOut = 0L
+            connectedSince = 0L
+        }
+    }
+
+    override fun updateByteCount(inBytes: Long, outBytes: Long, diffIn: Long, diffOut: Long) {
+        val now = SystemClock.elapsedRealtime()
+        synchronized(lock) {
+            var dl = 0.0
+            var ul = 0.0
+            if (lastTs != 0L && now > lastTs) {
+                val dt = (now - lastTs) / 1000.0
+                if (inBytes >= lastIn) dl = (inBytes - lastIn) / dt
+                if (outBytes >= lastOut) ul = (outBytes - lastOut) / dt
+            }
+            lastTs = now
+            lastIn = inBytes
+            lastOut = outBytes
+            System.arraycopy(d, 1, d, 0, N - 1)
+            System.arraycopy(u, 1, u, 0, N - 1)
+            d[N - 1] = dl.toFloat()
+            u[N - 1] = ul.toFloat()
+            downBps = dl
+            upBps = ul
+            totalIn = inBytes
+            totalOut = outBytes
+        }
+        onUpdate?.invoke()
+    }
+
+    override fun updateState(
+        state: String?, logmessage: String?, localizedResId: Int,
+        level: ConnectionStatus?, intent: Intent?
+    ) {
+        if (level == ConnectionStatus.LEVEL_CONNECTED) {
+            ensureConnected()
+        } else if (level != ConnectionStatus.LEVEL_VPNPAUSED) {
+            reset()
+        }
+        onUpdate?.invoke()
+    }
+
+    override fun setConnectedVPN(uuid: String?) {}
 }
