@@ -9,6 +9,7 @@ import android.Manifest
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.app.AlertDialog
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -30,7 +31,9 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.ArrayAdapter
+import android.widget.FrameLayout
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -51,11 +54,16 @@ import de.blinkt.openvpn.R
 import de.blinkt.openvpn.VpnProfile
 import de.blinkt.openvpn.core.ConfigParser
 import de.blinkt.openvpn.core.ConnectionStatus
+import de.blinkt.openvpn.core.LogItem
 import de.blinkt.openvpn.core.OpenVPNService
 import de.blinkt.openvpn.core.ProfileManager
 import de.blinkt.openvpn.core.VpnStatus
 import java.io.StringReader
+import java.net.ConnectException
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 
 class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.ByteCountListener {
 
@@ -83,6 +91,12 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
     private lateinit var graph: SpeedGraph
     private lateinit var serverNameTv: TextView
     private lateinit var serverSubTv: TextView
+    private lateinit var hintTv: TextView
+    private lateinit var speedLine: TextView
+    private lateinit var statsRow: LinearLayout
+    private lateinit var optionsChip: TextView
+    private lateinit var modeChip: TextView
+    private lateinit var lockOverlay: View
 
     private var pulse: ObjectAnimator? = null
     private var uiState = UiState.IDLE
@@ -108,6 +122,27 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
 
     private val notifLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val unlockLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+            if (r.resultCode == RESULT_OK) unlock() else toast("App continua bloqueado")
+        }
+
+    private var advanced = false
+    private var locked = false
+    private var unlocked = false
+    private var leftAt = 0L
+    private var hintAt = 0L
+    private val pingCache = ConcurrentHashMap<String, Long>()
+
+    private val logListener = object : VpnStatus.LogListener {
+        override fun newLog(logItem: LogItem?) {
+            if (logItem == null) return
+            val msg = try { logItem.getString(this@MainActivity) } catch (e: Exception) { return }
+            val h = friendly(msg ?: return) ?: return
+            runOnUiThread { showHint(h) }
+        }
+    }
 
     // ------------------------------------------------------------ helpers
 
@@ -184,6 +219,8 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             isAppearanceLightNavigationBars = false
         }
 
+        advanced = prefs().getBoolean("advanced", false)
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(12), dp(20), dp(16))
@@ -215,6 +252,10 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         top.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             .apply { leftMargin = -dp(6) })
 
+        modeChip = chip(if (advanced) "Simples" else "Avançado") { toggleMode() }
+        top.addView(modeChip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38))
+            .apply { rightMargin = dp(8) })
+
         top.addView(chip("Logs") {
             startActivity(Intent(this@MainActivity, LogWindow::class.java))
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38)))
@@ -239,10 +280,24 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(22) })
 
+        hintTv = label("", 13f, amber).apply {
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+        center.addView(hintTv, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(6) })
+
         timerTv = label("00:00:00", 26f, textSub).apply { gravity = Gravity.CENTER }
         center.addView(timerTv, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(4) })
+
+        speedLine = label("↓ 0 B/s     ↑ 0 B/s", 14f, textSub).apply { gravity = Gravity.CENTER }
+        center.addView(speedLine, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(10) })
 
         // Velocidade de download / upload
         downTv = label("0 B/s", 18f, textMain, true)
@@ -250,6 +305,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         downTotalTv = label("Total: 0 B", 11f, textSub)
         upTotalTv = label("Total: 0 B", 11f, textSub)
         val stats = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        statsRow = stats
         stats.addView(statBox("↓ Download", downTv, downTotalTv, green),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 .apply { rightMargin = dp(8) })
@@ -288,13 +344,24 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(chip("Usuário e senha") { showCredentialsDialog() },
             LinearLayout.LayoutParams(0, dp(50), 1f).apply { rightMargin = dp(5) })
-        row.addView(chip("Opções") { showOptionsDialog() },
+        optionsChip = chip("Opções") { showOptionsDialog() }
+        row.addView(optionsChip,
             LinearLayout.LayoutParams(0, dp(50), 1f).apply { leftMargin = dp(5) })
         root.addView(row, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(10) })
 
-        setContentView(scroll)
+        val frame = FrameLayout(this)
+        frame.addView(scroll, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        lockOverlay = buildLockOverlay()
+        lockOverlay.visibility = if (lockEnabled()) View.VISIBLE else View.GONE
+        frame.addView(lockOverlay, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        setContentView(frame)
+        if (lockEnabled()) setSecure(true)
+
+        applyMode()
         applyState(UiState.IDLE, "Desconectado")
         refreshServerCard()
 
@@ -306,7 +373,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         }
 
         // Primeiro uso: oferece adicionar um servidor
-        if (savedInstanceState == null && allProfiles().isEmpty()) {
+        if (savedInstanceState == null && allProfiles().isEmpty() && !lockEnabled()) {
             handler.post { showAddDialog() }
         }
     }
@@ -328,12 +395,28 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         lastTs = 0L
         VpnStatus.addStateListener(this)
         VpnStatus.addByteCountListener(this)
+        VpnStatus.addLogListener(logListener)
+
+        if (lockEnabled()) {
+            setSecure(true)
+            val now = SystemClock.elapsedRealtime()
+            if (!locked && (!unlocked || now - leftAt > 30000)) {
+                locked = true
+                lockOverlay.visibility = View.VISIBLE
+                launchUnlock()
+            }
+        } else {
+            locked = false
+            lockOverlay.visibility = View.GONE
+        }
     }
 
     override fun onPause() {
         super.onPause()
+        leftAt = SystemClock.elapsedRealtime()
         VpnStatus.removeStateListener(this)
         VpnStatus.removeByteCountListener(this)
+        VpnStatus.removeLogListener(logListener)
     }
 
     override fun onDestroy() {
@@ -352,12 +435,16 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         upTv.text = "0 B/s"
         downTotalTv.text = "Total: 0 B"
         upTotalTv.text = "Total: 0 B"
+        speedLine.text = "↓ 0 B/s     ↑ 0 B/s"
         graph.clear()
     }
 
     private fun applyState(state: UiState, message: String, errorColor: Boolean = false) {
         val previous = uiState
         uiState = state
+        if (state == UiState.CONNECTED) clearHint()
+        if (state == UiState.IDLE && message == "Desconectado" &&
+            SystemClock.elapsedRealtime() - hintAt > 6000) clearHint()
         val color = when (state) {
             UiState.CONNECTED -> green
             UiState.CONNECTING -> amber
@@ -411,9 +498,15 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
                 ConnectionStatus.LEVEL_NOTCONNECTED, null, ConnectionStatus.UNKNOWN_LEVEL ->
                     applyState(UiState.IDLE, "Desconectado")
                 ConnectionStatus.LEVEL_AUTH_FAILED ->
+                {
                     applyState(UiState.IDLE, "Falha de autenticação", true)
+                    showHint("Usuário ou senha incorretos. Toque em “Usuário e senha” para corrigir.")
+                }
                 ConnectionStatus.LEVEL_NONETWORK ->
+                {
                     applyState(UiState.CONNECTING, "Sem rede, aguardando…")
+                    showHint("Sem internet no momento. Verifique seu Wi-Fi ou dados móveis.")
+                }
                 ConnectionStatus.LEVEL_VPNPAUSED ->
                     applyState(UiState.CONNECTING, "Pausado")
                 else ->
@@ -441,6 +534,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             upTv.text = humanSpeed(ul)
             downTotalTv.text = "Total: " + humanBytes(inBytes)
             upTotalTv.text = "Total: " + humanBytes(outBytes)
+            speedLine.text = "↓ ${humanSpeed(dl)}     ↑ ${humanSpeed(ul)}"
             graph.push(dl.toFloat(), ul.toFloat())
         }
     }
@@ -489,7 +583,16 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
     private fun showServerDialog() {
         val list = allProfiles()
         val names = ArrayList<String>()
-        list.forEach { names.add(it.mName) }
+        list.forEach {
+            val ms = pingCache[it.uuidString]
+            val suffix = when {
+                ms == null -> ""
+                ms < 0 -> "   •   sem resposta"
+                else -> "   •   $ms ms"
+            }
+            names.add(it.mName + suffix)
+        }
+        names.add("⚡ Testar ping / melhor servidor")
         names.add("➕ Adicionar servidor")
         val sel = selectedProfile()
         if (sel != null) names.add("🗑 Remover \"${sel.mName}\"")
@@ -502,7 +605,8 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
                         prefs().edit().putString("selected", list[which].uuidString).apply()
                         refreshServerCard()
                     }
-                    which == list.size -> showAddDialog()
+                    which == list.size -> testPings()
+                    which == list.size + 1 -> showAddDialog()
                     else -> sel?.let { removeProfile(it) }
                 }
             }
@@ -788,9 +892,14 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
     // ------------------------------------------------------- Opcoes
 
     private fun showOptionsDialog() {
+        val sel = selectedProfile()
+        val tuned = sel != null && isTuned(sel)
         val items = arrayOf(
             "DNS personalizado",
             "Apps que usam a VPN",
+            if (tuned) "⚡ Otimizar velocidade: LIGADO" else "⚡ Otimizar velocidade: DESLIGADO",
+            "Dicas para mais velocidade",
+            if (lockEnabled()) "🔒 Bloqueio do app (PIN/digital): LIGADO" else "🔓 Bloqueio do app (PIN/digital): DESLIGADO",
             "Bloquear internet sem VPN",
             "Ver meu IP público"
         )
@@ -800,7 +909,10 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
                 when (which) {
                     0 -> showDnsDialog()
                     1 -> showAppsDialog()
-                    2 -> showKillSwitchDialog()
+                    2 -> toggleTuning()
+                    3 -> showSpeedTips()
+                    4 -> toggleLock()
+                    5 -> showKillSwitchDialog()
                     else -> showIp()
                 }
             }
@@ -945,6 +1057,7 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
             showAddDialog()
             return
         }
+        clearHint()
         ProfileManager.saveProfile(this, p)
         val intent = Intent(this, LaunchVPN::class.java)
         intent.putExtra(LaunchVPN.EXTRA_KEY, p.uuid.toString())
@@ -952,6 +1065,242 @@ class MainActivity : AppCompatActivity(), VpnStatus.StateListener, VpnStatus.Byt
         intent.action = Intent.ACTION_MAIN
         startActivity(intent)
     }
+
+    // ------------------------------------------- Modo simples / avancado
+
+    private fun toggleMode() {
+        advanced = !advanced
+        prefs().edit().putBoolean("advanced", advanced).apply()
+        applyMode()
+    }
+
+    private fun applyMode() {
+        val adv = if (advanced) View.VISIBLE else View.GONE
+        statsRow.visibility = adv
+        graph.visibility = adv
+        optionsChip.visibility = adv
+        speedLine.visibility = if (advanced) View.GONE else View.VISIBLE
+        modeChip.text = if (advanced) "Simples" else "Avançado"
+    }
+
+    // ------------------------------------------------- Mensagens de erro
+
+    private fun showHint(msg: String) {
+        hintAt = SystemClock.elapsedRealtime()
+        hintTv.text = msg
+        hintTv.visibility = View.VISIBLE
+    }
+
+    private fun clearHint() {
+        hintTv.text = ""
+        hintTv.visibility = View.GONE
+    }
+
+    private fun friendly(m: String): String? {
+        val s = m.lowercase()
+        return when {
+            "auth_failed" in s || "auth failed" in s || "authentication failed" in s ->
+                "Usuário ou senha incorretos. Toque em “Usuário e senha” para corrigir."
+            "cannot resolve host" in s || "resolve: cannot" in s || "unknownhost" in s ->
+                "Não achei o servidor. Confira o endereço e sua internet."
+            "connection refused" in s || "econnrefused" in s ->
+                "O servidor recusou a conexão. Confira a porta ou se ele está ligado."
+            "verify error" in s || "certificate verify failed" in s || "unable to get local issuer" in s ->
+                "O certificado do servidor não confere. Confira o certificado CA."
+            "tls key negotiation failed" in s || "tls handshake failed" in s ->
+                "O servidor não respondeu. Confira endereço e porta, ou tente TCP na porta 443."
+            "network is unreachable" in s || "no network" in s ->
+                "Sem internet no momento."
+            "cipher" in s && ("mismatch" in s || "not supported" in s || "no common" in s) ->
+                "A criptografia não é compatível com o servidor. Tente a cifra “Automático”."
+            else -> null
+        }
+    }
+
+    // ------------------------------------------------------------- Ping
+
+    private fun profileEndpoint(p: VpnProfile): Pair<String, Int>? {
+        val c = p.mConnections.firstOrNull() ?: return null
+        return Pair(c.mServerName, c.mServerPort.toIntOrNull() ?: 1194)
+    }
+
+    private fun measure(host: String, port: Int): Long {
+        return try {
+            val addr = InetSocketAddress(host, port)
+            if (addr.isUnresolved) return -1L
+            val s = Socket()
+            val t0 = SystemClock.elapsedRealtime()
+            try {
+                s.connect(addr, 3000)
+            } catch (e: ConnectException) {
+                val m = e.message ?: ""
+                if (!m.contains("refused", true) && !m.contains("ECONNREFUSED")) throw e
+            } finally {
+                try { s.close() } catch (e: Exception) { }
+            }
+            SystemClock.elapsedRealtime() - t0
+        } catch (e: Exception) {
+            -1L
+        }
+    }
+
+    private fun testPings() {
+        if (uiState != UiState.IDLE) {
+            toast("Desconecte a VPN para testar o ping")
+            return
+        }
+        val list = allProfiles()
+        if (list.isEmpty()) { toast("Adicione um servidor primeiro"); return }
+        toast("Testando ping…")
+        Thread {
+            val workers = list.map { p ->
+                Thread {
+                    val ep = profileEndpoint(p)
+                    pingCache[p.uuidString] = if (ep == null) -1L else measure(ep.first, ep.second)
+                }.also { it.start() }
+            }
+            workers.forEach { try { it.join(5000) } catch (e: Exception) { } }
+            runOnUiThread { showPingResults(list) }
+        }.start()
+    }
+
+    private fun showPingResults(list: List<VpnProfile>) {
+        val sorted = list.sortedBy {
+            val ms = pingCache[it.uuidString] ?: -1L
+            if (ms < 0) Long.MAX_VALUE else ms
+        }
+        val best = sorted.firstOrNull { (pingCache[it.uuidString] ?: -1L) >= 0 }
+        val labels = sorted.map {
+            val ms = pingCache[it.uuidString] ?: -1L
+            val star = if (it === best) "⚡ " else ""
+            if (ms < 0) "${it.mName}  —  sem resposta" else "$star${it.mName}  —  $ms ms"
+        }.toTypedArray()
+        val b = AlertDialog.Builder(this)
+            .setTitle("Ping (menor é melhor)")
+            .setItems(labels) { _, which ->
+                prefs().edit().putString("selected", sorted[which].uuidString).apply()
+                refreshServerCard()
+            }
+            .setNegativeButton("Fechar", null)
+        if (best != null) {
+            b.setPositiveButton("Usar o melhor") { _, _ ->
+                prefs().edit().putString("selected", best.uuidString).apply()
+                refreshServerCard()
+                toast("Servidor escolhido: ${best.mName}")
+            }
+        }
+        b.show()
+    }
+
+    // ---------------------------------------------------- Velocidade
+
+    private val tuning = "sndbuf 524288\nrcvbuf 524288"
+
+    private fun isTuned(p: VpnProfile): Boolean =
+        p.mUseCustomConfig && p.mCustomConfigOptions.contains("sndbuf 524288")
+
+    private fun toggleTuning() {
+        val p = selectedProfile()
+        if (p == null) { toast("Adicione um servidor primeiro"); return }
+        if (isTuned(p)) {
+            p.mCustomConfigOptions = p.mCustomConfigOptions
+                .replace("sndbuf 524288", "").replace("rcvbuf 524288", "").trim()
+            if (p.mCustomConfigOptions.isEmpty()) p.mUseCustomConfig = false
+            toast("Otimização desligada. Reconecte para aplicar.")
+        } else {
+            p.mCustomConfigOptions = (p.mCustomConfigOptions + "\n" + tuning).trim()
+            p.mUseCustomConfig = true
+            toast("Otimização ligada. Reconecte para aplicar.")
+        }
+        ProfileManager.saveProfile(this, p)
+    }
+
+    private fun showSpeedTips() {
+        AlertDialog.Builder(this)
+            .setTitle("Dicas para mais velocidade")
+            .setMessage(
+                "• Use o servidor mais perto de você (veja o ping em Servidor).\n\n" +
+                "• Prefira UDP; use TCP só se o UDP não conectar.\n\n" +
+                "• Na configuração manual, a cifra AES-GCM costuma ser a mais rápida.\n\n" +
+                "• \"Otimizar velocidade\" aumenta os buffers de rede. O ganho varia.\n\n" +
+                "• A velocidade final depende do servidor e da sua internet; o app não " +
+                "consegue ultrapassar esse limite."
+            )
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    // ------------------------------------------------ Bloqueio do app
+
+    private fun lockEnabled(): Boolean = prefs().getBoolean("lock", false)
+
+    private fun keyguard(): KeyguardManager =
+        getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+
+    private fun setSecure(on: Boolean) {
+        if (on) {
+            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
+
+    private fun toggleLock() {
+        if (lockEnabled()) {
+            prefs().edit().putBoolean("lock", false).apply()
+            setSecure(false)
+            toast("Bloqueio desligado")
+            return
+        }
+        if (!keyguard().isDeviceSecure) {
+            showError(
+                "Sem bloqueio de tela",
+                "Configure um PIN, padrão, senha ou digital nos ajustes do Android para usar esta opção."
+            )
+            return
+        }
+        prefs().edit().putBoolean("lock", true).apply()
+        setSecure(true)
+        unlocked = true
+        toast("Bloqueio ligado")
+    }
+
+    private fun launchUnlock() {
+        val i = keyguard().createConfirmDeviceCredentialIntent(
+            "PARA VPN", "Confirme que é você para abrir o app")
+        if (i == null) {
+            unlock()
+            return
+        }
+        try {
+            unlockLauncher.launch(i)
+        } catch (e: Exception) {
+            unlock()
+        }
+    }
+
+    private fun unlock() {
+        locked = false
+        unlocked = true
+        lockOverlay.visibility = View.GONE
+    }
+
+    private fun buildLockOverlay(): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(bg)
+            isClickable = true
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.ic_para_fg)
+            }, LinearLayout.LayoutParams(dp(140), dp(140)))
+            addView(label("PARA VPN bloqueado", 18f, textMain, true).apply {
+                gravity = Gravity.CENTER
+            })
+            addView(chip("Desbloquear") { launchUnlock() },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48))
+                    .apply { topMargin = dp(20) })
+        }
 
     // ----------------------------------------------- Grafico de velocidade
 
